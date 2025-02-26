@@ -134,7 +134,7 @@ class FileSelector:
             'react', 'vue', 'angular', 'node', 'express', 'django', 'flask',
             'python', 'javascript', 'typescript', 'java', 'kotlin', 'swift',
             'go', 'rust', 'c#', 'csharp', 'dotnet', 'php', 'laravel', 'ruby',
-            'rails', 'mongodb', 'mysql', 'postgresql', 'firebase', 'aws',
+            'rails', 'mongodb', 'mongo', 'mysql', 'postgresql', 'firebase', 'aws',
             'azure', 'gcp', 'docker', 'kubernetes', 'graphql', 'rest', 'api',
             'redux', 'vuex', 'mobx', 'tensorflow', 'pytorch', 'keras',
             'scikit', 'pandas', 'numpy', 'matplotlib', 'seaborn', 'dask',
@@ -145,7 +145,9 @@ class FileSelector:
             'nextjs', 'nuxt', 'gatsby', 'svelte', 'flutter', 'react-native',
             'ionic', 'electron', 'pwa', 'webassembly', 'wasm', 'deno', 'bun',
             'groq', 'mistral', 'llama', 'claude', 'gpt', 'openai', 'huggingface',
-            'transformers', 'bert', 'llm', 'rag', 'langchain', 'pinecone'
+            'transformers', 'bert', 'llm', 'rag', 'langchain', 'pinecone',
+            'database', 'db', 'connect', 'connection', 'config', 'configuration',
+            'setup', 'install', 'env', 'environment', 'variable'
         }
         
         # Check if any tech keywords are in the original query (case insensitive)
@@ -153,6 +155,26 @@ class FileSelector:
         for tech in tech_keywords:
             if tech in query_lower and tech not in keywords:
                 keywords.append(tech)
+        
+        # Add related keywords for specific technologies
+        if 'mongo' in query_lower or 'mongodb' in query_lower:
+            related_keywords = ['database', 'db', 'connect', 'connection', 'config', 'nosql']
+            for keyword in related_keywords:
+                if keyword not in keywords:
+                    keywords.append(keyword)
+                    
+        if 'laravel' in query_lower:
+            related_keywords = ['php', 'framework', 'config', 'env', 'database', 'db']
+            for keyword in related_keywords:
+                if keyword not in keywords:
+                    keywords.append(keyword)
+        
+        # If the query is about connecting technologies, add connection-related keywords
+        if 'connect' in query_lower or 'connection' in query_lower or 'setup' in query_lower:
+            related_keywords = ['config', 'configuration', 'env', 'environment', 'variable', 'setting']
+            for keyword in related_keywords:
+                if keyword not in keywords:
+                    keywords.append(keyword)
         
         return keywords
     
@@ -304,15 +326,18 @@ class FileSelector:
             'docker': [r'docker', r'dockerfile', r'compose'],
             'kubernetes': [r'k8s', r'kubernetes', r'helm'],
             'aws': [r'aws', r'amazon', r'lambda', r's3', r'ec2'],
-            'database': [r'db', r'database', r'sql', r'mongo', r'postgres'],
+            'database': [r'db', r'database', r'sql', r'mongo', r'postgres', r'\.env', r'config'],
             'api': [r'api', r'rest', r'graphql', r'endpoint'],
             'auth': [r'auth', r'login', r'jwt', r'oauth'],
             'test': [r'test', r'spec', r'jest', r'mocha', r'cypress'],
+            'mongodb': [r'mongo', r'mongodb', r'nosql', r'database\.php', r'\.env', r'config'],
+            'laravel': [r'laravel', r'\.env', r'config', r'database\.php', r'composer\.json'],
+            'connect': [r'\.env', r'config', r'database', r'connection', r'setup'],
         }
         
         # Check if any technology is mentioned in the query
         for tech, patterns in tech_patterns.items():
-            if tech in query_lower:
+            if tech in query_lower or (tech == 'mongodb' and 'mongo' in query_lower) or (tech == 'connect' and ('connect' in query_lower or 'connection' in query_lower or 'setup' in query_lower)):
                 # Find files matching the patterns
                 for file_path in all_files:
                     file_path_lower = file_path.lower()
@@ -321,7 +346,14 @@ class FileSelector:
                             tech_files.append(file_path)
                             break
         
-        return tech_files
+        # Always include important configuration files for database connections
+        important_config_files = ['.env', '.env.example', 'database.php', 'config/database.php', 'config/app.php', 'composer.json']
+        for file_path in all_files:
+            file_name = os.path.basename(file_path)
+            if file_name in important_config_files or any(config_file in file_path for config_file in important_config_files):
+                tech_files.append(file_path)
+        
+        return list(set(tech_files))  # Remove duplicates
     
     def _read_file(self, file_path: str) -> str:
         """
@@ -333,30 +365,11 @@ class FileSelector:
         Returns:
             str: Contents of the file, or None if the file cannot be read
         """
-        full_path = os.path.join(self.repo_path, file_path)
+        # When using MongoDB, we need to get the file content from the database
+        # This method is called from get_relevant_files, which is called from chat_with_codebase
+        # In chat_with_codebase, we're using git_handler.get_file_content to get the actual content
+        # So here we just return a placeholder that will be replaced later
         
-        # Skip large files
-        try:
-            file_size = os.path.getsize(full_path)
-            if file_size > 1000000:  # Skip files larger than ~1MB
-                return f"[Large file: {file_size} bytes - content omitted]"
-        except Exception:
-            return None
-            
-        # Try different encodings
-        encodings = ['utf-8', 'latin-1', 'cp1252', 'ascii']
-        
-        for encoding in encodings:
-            try:
-                with open(full_path, 'r', encoding=encoding) as f:
-                    content = f.read()
-                    # Ensure content is properly encoded
-                    content = content.encode('utf-8', errors='replace').decode('utf-8')
-                    return content
-            except UnicodeDecodeError:
-                continue
-            except Exception:
-                return None
-                
-        # If all encodings fail, treat as binary
-        return None
+        # For scoring purposes, we'll return a small placeholder
+        # The actual content will be fetched from MongoDB in chat_with_codebase
+        return f"[File content will be fetched from MongoDB: {file_path}]"
