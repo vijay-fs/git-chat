@@ -168,6 +168,45 @@ Example:
 python -m src.main delete --owner username --repo repo --force
 ```
 
+
+
+## How It Works
+
+### Chat Process and Data Retrieval
+
+Git-Claude-Chat uses a sophisticated process to retrieve and analyze code from GitHub repositories:
+
+1. **Repository Fetching**:
+   - The tool uses the GitHub API to fetch repository data
+   - Files are downloaded, processed, and stored in MongoDB
+   - Binary files and files larger than 1MB are automatically excluded
+
+2. **Relevant File Selection**:
+   - When you ask a question, the tool analyzes your query to extract keywords
+   - Files are scored based on relevance to your query using:
+     - Filename matching
+     - Content matching
+     - File importance (e.g., configuration files, READMEs)
+     - Technology-specific patterns
+
+3. **Context Building**:
+   - The most relevant files are selected (up to the specified limit)
+   - File contents are retrieved from MongoDB
+   - A context is built with all selected files, respecting token limits
+
+4. **Claude AI Interaction**:
+   - A system prompt is created with the repository context
+   - Your query is sent to Claude AI along with the context
+   - Claude analyzes the code and provides a detailed response
+   - The response references specific files and code sections
+
+5. **Performance Optimization**:
+   - Files are cached in MongoDB for fast retrieval
+   - Smart file selection reduces token usage
+   - Configurable parameters allow fine-tuning for different repositories
+
+This process ensures that Claude AI has the most relevant code context to answer your questions accurately, while managing token usage efficiently.
+
 ## License
 
 MIT
