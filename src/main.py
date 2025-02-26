@@ -13,41 +13,51 @@ from rich.markdown import Markdown
 from src.git_handler import GitHandler
 from src.claude_client import ClaudeClient
 from src.file_selector import FileSelector
+from src.mongodb_handler import MongoDBHandler
 
 # Load environment variables from .env file
-load_dotenv()
+# Get the directory of the current script
+script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+dotenv_path = os.path.join(script_dir, '.env')
+load_dotenv(dotenv_path)
 
-app = typer.Typer(help="Git-Claude-Chat: Chat with Git repositories using Claude AI")
+app = typer.Typer(help="Git-Claude-Chat: Chat with GitHub repositories using Claude AI")
 console = Console()
 
-# Global state to store the current repository path
-REPO_PATH = None
+# Global state to store the current repository ID
+REPO_ID = None
 
-@app.command("clone")
-def clone_repository(
-    repo_url: str = typer.Argument(..., help="URL of the Git repository to clone"),
-    output_path: Optional[str] = typer.Option(
-        None, "--output", "-o", help="Local path to store the repository"
+@app.command("fetch")
+def fetch_repository(
+    repo_url: str = typer.Argument(..., help="URL of the GitHub repository to fetch"),
+    owner: Optional[str] = typer.Option(
+        None, "--owner", help="Repository owner (alternative to repo_url)"
+    ),
+    repo: Optional[str] = typer.Option(
+        None, "--repo", help="Repository name (alternative to repo_url)"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Force re-fetching even if repository already exists"
     ),
 ):
     """
-    Clone a Git repository.
+    Fetch a GitHub repository using the GitHub API.
     """
-    global REPO_PATH
+    global REPO_ID
     
-    git_handler = GitHandler(repo_url=repo_url, local_path=output_path)
+    git_handler = GitHandler(repo_url=repo_url, owner=owner, repo=repo)
     
     try:
-        REPO_PATH = git_handler.clone_repository()
+        REPO_ID = git_handler.fetch_repository(force=force)
         
-        # Save the repository path to a config file for future use
+        # Save the repository ID to a config file for future use
         config_dir = Path.home() / ".git-claude-chat"
         config_dir.mkdir(exist_ok=True)
         
         with open(config_dir / "last_repo.txt", "w") as f:
-            f.write(REPO_PATH)
+            f.write(REPO_ID)
             
-        console.print(f"[green]Repository cloned successfully to {REPO_PATH}")
+        console.print(f"[green]Repository fetched successfully with ID: {REPO_ID}")
         console.print("[yellow]You can now use the 'chat' command to interact with the codebase")
     except Exception as e:
         console.print(f"[red]Error: {e}")
@@ -56,8 +66,14 @@ def clone_repository(
 @app.command("chat")
 def chat_with_codebase(
     message: str = typer.Argument(..., help="Message or question about the codebase"),
-    repo_path: Optional[str] = typer.Option(
-        None, "--repo", "-r", help="Path to the Git repository"
+    repo_id: Optional[str] = typer.Option(
+        None, "--repo-id", help="ID of the repository in MongoDB"
+    ),
+    owner: Optional[str] = typer.Option(
+        None, "--owner", help="Repository owner"
+    ),
+    repo: Optional[str] = typer.Option(
+        None, "--repo", help="Repository name"
     ),
     max_files: int = typer.Option(
         20, "--max-files", "-m", help="Maximum number of files to include in the context"
@@ -78,64 +94,85 @@ def chat_with_codebase(
     """
     Chat with Claude about the codebase.
     """
-    global REPO_PATH
+    global REPO_ID
     
-    # Determine the repository path
-    if repo_path:
-        REPO_PATH = repo_path
-    elif not REPO_PATH:
+    # Determine the repository ID
+    target_repo_id = repo_id or REPO_ID
+    
+    # If owner and repo are provided, try to find the repository in MongoDB
+    if not target_repo_id and owner and repo:
+        mongodb = MongoDBHandler()
+        repo_info = mongodb.get_repository_by_name(owner, repo)
+        if repo_info:
+            target_repo_id = str(repo_info["_id"])
+    
+    if not target_repo_id:
         # Try to load from config
         config_file = Path.home() / ".git-claude-chat" / "last_repo.txt"
         if config_file.exists():
             with open(config_file, "r") as f:
-                REPO_PATH = f.read().strip()
+                target_repo_id = f.read().strip()
         
-    if not REPO_PATH:
-        console.print("[red]No repository specified. Use the 'clone' command first or specify a path with --repo")
+    if not target_repo_id:
+        console.print("[red]No repository specified. Use the 'fetch' command first or specify a repository with --repo-id, or --owner and --repo")
+        sys.exit(1)
+        
+    # Initialize the MongoDB handler
+    mongodb = MongoDBHandler()
+    
+    # Get repository info
+    repo_info = mongodb.get_repository_info(target_repo_id)
+    if not repo_info:
+        console.print(f"[red]Repository with ID {target_repo_id} not found in the database")
         sys.exit(1)
         
     # Initialize the Git handler
-    git_handler = GitHandler(local_path=REPO_PATH)
+    git_handler = GitHandler(owner=repo_info["owner"], repo=repo_info["name"])
+    git_handler.repo_id = target_repo_id
     
     try:
         # Get the list of files
-        files = git_handler.get_file_list(ignore_patterns=ignore_patterns)
+        all_files = git_handler.get_all_files()
         
-        if not files:
-            console.print("[yellow]No files found in the repository")
+        if not all_files:
+            console.print("[red]No files found in the repository")
             sys.exit(1)
             
-        console.print(f"Repository has {len(files)} files. Using smart file selection...")
+        console.print(f"[green]Found {len(all_files)} files in the repository")
         
-        # Use the FileSelector to get relevant files
-        file_selector = FileSelector(REPO_PATH)
-        code_files, token_count = file_selector.get_relevant_files(
-            message, 
-            files, 
-            max_files=max_files,
-            max_tokens=max_tokens_context
+        # Initialize the file selector
+        file_selector = FileSelector(repo_info["full_name"])
+        
+        # Get the most relevant files for the query
+        console.print(f"[yellow]Selecting relevant files for: {message}")
+        relevant_files, token_count = file_selector.get_relevant_files(
+            message, all_files, max_files, max_tokens_context
         )
         
-        if not code_files:
-            console.print("[yellow]No relevant files found for your query")
+        if not relevant_files:
+            console.print("[red]No relevant files found for the query")
             sys.exit(1)
             
-        console.print(f"[green]Selected {len(code_files)} relevant files with approximately {token_count} tokens")
-            
+        console.print(f"[green]Selected {len(relevant_files)} relevant files (approx. {token_count} tokens)")
+        
+        # Prepare the files dictionary for Claude
+        files_dict = {}
+        for file_path, _ in relevant_files.items():
+            content = git_handler.get_file_content(file_path)
+            if content:
+                files_dict[file_path] = content
+                
         # Initialize the Claude client
         claude_client = ClaudeClient()
         
-        console.print("[green]Sending your question to Claude...")
-        
-        # Get the response from Claude
+        # Chat with Claude
+        console.print("[yellow]Sending request to Claude...")
         response = claude_client.chat_with_codebase(
-            message, 
-            code_files, 
-            max_tokens=max_tokens_response,
-            model=model
+            message, files_dict, max_tokens_response, model
         )
         
-        # Print the response as markdown
+        # Print the response
+        console.print("\n[bold green]Claude's response:[/bold green]")
         console.print(Markdown(response))
         
     except Exception as e:
@@ -144,8 +181,14 @@ def chat_with_codebase(
 
 @app.command("analyze")
 def analyze_codebase(
-    repo_path: Optional[str] = typer.Option(
-        None, "--repo", "-r", help="Path to the Git repository"
+    repo_id: Optional[str] = typer.Option(
+        None, "--repo-id", help="ID of the repository in MongoDB"
+    ),
+    owner: Optional[str] = typer.Option(
+        None, "--owner", help="Repository owner"
+    ),
+    repo: Optional[str] = typer.Option(
+        None, "--repo", help="Repository name"
     ),
     max_files: int = typer.Option(
         20, "--max-files", "-m", help="Maximum number of files to include in the context"
@@ -166,76 +209,110 @@ def analyze_codebase(
     """
     Get a general analysis of the codebase.
     """
-    global REPO_PATH
+    global REPO_ID
     
-    # Determine the repository path
-    if repo_path:
-        REPO_PATH = repo_path
-    elif not REPO_PATH:
+    # Determine the repository ID
+    target_repo_id = repo_id or REPO_ID
+    
+    # If owner and repo are provided, try to find the repository in MongoDB
+    if not target_repo_id and owner and repo:
+        mongodb = MongoDBHandler()
+        repo_info = mongodb.get_repository_by_name(owner, repo)
+        if repo_info:
+            target_repo_id = str(repo_info["_id"])
+    
+    if not target_repo_id:
         # Try to load from config
         config_file = Path.home() / ".git-claude-chat" / "last_repo.txt"
         if config_file.exists():
             with open(config_file, "r") as f:
-                REPO_PATH = f.read().strip()
+                target_repo_id = f.read().strip()
         
-    if not REPO_PATH:
-        console.print("[red]No repository specified. Use the 'clone' command first or specify a path with --repo")
+    if not target_repo_id:
+        console.print("[red]No repository specified. Use the 'fetch' command first or specify a repository with --repo-id, or --owner and --repo")
+        sys.exit(1)
+        
+    # Initialize the MongoDB handler
+    mongodb = MongoDBHandler()
+    
+    # Get repository info
+    repo_info = mongodb.get_repository_info(target_repo_id)
+    if not repo_info:
+        console.print(f"[red]Repository with ID {target_repo_id} not found in the database")
         sys.exit(1)
         
     # Initialize the Git handler
-    git_handler = GitHandler(local_path=REPO_PATH)
+    git_handler = GitHandler(owner=repo_info["owner"], repo=repo_info["name"])
+    git_handler.repo_id = target_repo_id
     
     try:
         # Get the list of files
-        files = git_handler.get_file_list(ignore_patterns=ignore_patterns)
+        all_files = git_handler.get_all_files()
         
-        if not files:
-            console.print("[yellow]No files found in the repository")
+        if not all_files:
+            console.print("[red]No files found in the repository")
             sys.exit(1)
             
-        console.print(f"Repository has {len(files)} files. Using smart file selection...")
+        console.print(f"[green]Found {len(all_files)} files in the repository")
         
-        # For analysis, we'll use a generic query that prioritizes important files
-        analysis_query = "analyze code architecture structure main components"
+        # Initialize the file selector
+        file_selector = FileSelector(repo_info["full_name"])
         
-        # Use the FileSelector to get relevant files
-        file_selector = FileSelector(REPO_PATH)
-        code_files, token_count = file_selector.get_relevant_files(
-            analysis_query, 
-            files, 
-            max_files=max_files,
-            max_tokens=max_tokens_context
+        # Get a representative sample of files
+        console.print("[yellow]Selecting representative files for analysis...")
+        relevant_files, token_count = file_selector.get_representative_files(
+            all_files, max_files, max_tokens_context
         )
         
-        if not code_files:
-            console.print("[yellow]No relevant files found for analysis")
+        if not relevant_files:
+            console.print("[red]No relevant files found for analysis")
             sys.exit(1)
             
-        console.print(f"[green]Selected {len(code_files)} relevant files with approximately {token_count} tokens")
-            
+        console.print(f"[green]Selected {len(relevant_files)} representative files (approx. {token_count} tokens)")
+        
+        # Prepare the files dictionary for Claude
+        files_dict = {}
+        for file_path, _ in relevant_files.items():
+            content = git_handler.get_file_content(file_path)
+            if content:
+                files_dict[file_path] = content
+                
         # Initialize the Claude client
         claude_client = ClaudeClient()
         
-        console.print("[green]Analyzing codebase with Claude...")
-        
-        # Get the analysis from Claude
-        analysis = claude_client.analyze_codebase(
-            code_files, 
-            max_tokens=max_tokens_response,
-            model=model
+        # Ask Claude for an analysis
+        console.print("[yellow]Sending request to Claude...")
+        analysis_prompt = (
+            "Please analyze this codebase and provide a comprehensive overview. Include:\n"
+            "1. The main purpose and functionality of the project\n"
+            "2. The architecture and key components\n"
+            "3. Technologies and frameworks used\n"
+            "4. Code organization and patterns\n"
+            "5. Potential areas for improvement\n"
         )
         
-        # Print the analysis as markdown
-        console.print(Markdown(analysis))
+        response = claude_client.chat_with_codebase(
+            analysis_prompt, files_dict, max_tokens_response, model
+        )
+        
+        # Print the response
+        console.print("\n[bold green]Codebase Analysis:[/bold green]")
+        console.print(Markdown(response))
         
     except Exception as e:
         console.print(f"[red]Error: {e}")
         sys.exit(1)
 
-@app.command("list-files")
+@app.command("list")
 def list_files(
-    repo_path: Optional[str] = typer.Option(
-        None, "--repo", "-r", help="Path to the Git repository"
+    repo_id: Optional[str] = typer.Option(
+        None, "--repo-id", help="ID of the repository in MongoDB"
+    ),
+    owner: Optional[str] = typer.Option(
+        None, "--owner", help="Repository owner"
+    ),
+    repo: Optional[str] = typer.Option(
+        None, "--repo", help="Repository name"
     ),
     ignore_patterns: Optional[List[str]] = typer.Option(
         None, "--ignore", "-i", help="Patterns to ignore when listing files"
@@ -244,95 +321,146 @@ def list_files(
     """
     List all files in the repository.
     """
-    global REPO_PATH
+    global REPO_ID
     
-    # Determine the repository path
-    if repo_path:
-        REPO_PATH = repo_path
-    elif not REPO_PATH:
+    # Determine the repository ID
+    target_repo_id = repo_id or REPO_ID
+    
+    # If owner and repo are provided, try to find the repository in MongoDB
+    if not target_repo_id and owner and repo:
+        mongodb = MongoDBHandler()
+        repo_info = mongodb.get_repository_by_name(owner, repo)
+        if repo_info:
+            target_repo_id = str(repo_info["_id"])
+    
+    if not target_repo_id:
         # Try to load from config
         config_file = Path.home() / ".git-claude-chat" / "last_repo.txt"
         if config_file.exists():
             with open(config_file, "r") as f:
-                REPO_PATH = f.read().strip()
+                target_repo_id = f.read().strip()
         
-    if not REPO_PATH:
-        console.print("[red]No repository specified. Use the 'clone' command first or specify a path with --repo")
+    if not target_repo_id:
+        console.print("[red]No repository specified. Use the 'fetch' command first or specify a repository with --repo-id, or --owner and --repo")
+        sys.exit(1)
+        
+    # Initialize the MongoDB handler
+    mongodb = MongoDBHandler()
+    
+    # Get repository info
+    repo_info = mongodb.get_repository_info(target_repo_id)
+    if not repo_info:
+        console.print(f"[red]Repository with ID {target_repo_id} not found in the database")
         sys.exit(1)
         
     # Initialize the Git handler
-    git_handler = GitHandler(local_path=REPO_PATH)
+    git_handler = GitHandler(owner=repo_info["owner"], repo=repo_info["name"])
+    git_handler.repo_id = target_repo_id
     
     try:
         # Get the list of files
-        files = git_handler.get_file_list(ignore_patterns=ignore_patterns)
+        all_files = git_handler.get_all_files()
         
-        if not files:
-            console.print("[yellow]No files found in the repository")
+        if not all_files:
+            console.print("[red]No files found in the repository")
             sys.exit(1)
             
+        # Filter files based on ignore patterns
+        if ignore_patterns:
+            filtered_files = []
+            for file_path in all_files:
+                if not any(pattern in file_path for pattern in ignore_patterns):
+                    filtered_files.append(file_path)
+            all_files = filtered_files
+            
         # Print the files
-        console.print(f"[green]Found {len(files)} files in the repository:")
-        for file in files:
-            console.print(f"  {file}")
+        console.print(f"[green]Found {len(all_files)} files in the repository:")
+        for file_path in sorted(all_files):
+            console.print(f"  {file_path}")
+            
+    except Exception as e:
+        console.print(f"[red]Error: {e}")
+        sys.exit(1)
+
+@app.command("delete")
+def delete_repository(
+    repo_id: Optional[str] = typer.Option(
+        None, "--repo-id", help="ID of the repository in MongoDB"
+    ),
+    owner: Optional[str] = typer.Option(
+        None, "--owner", help="Repository owner"
+    ),
+    repo: Optional[str] = typer.Option(
+        None, "--repo", help="Repository name"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Force deletion without confirmation"
+    ),
+):
+    """
+    Delete a repository from the database.
+    """
+    global REPO_ID
+    
+    # Determine the repository ID
+    target_repo_id = repo_id or REPO_ID
+    
+    # If owner and repo are provided, try to find the repository in MongoDB
+    if not target_repo_id and owner and repo:
+        mongodb = MongoDBHandler()
+        repo_info = mongodb.get_repository_by_name(owner, repo)
+        if repo_info:
+            target_repo_id = str(repo_info["_id"])
+    
+    if not target_repo_id:
+        # Try to load from config
+        config_file = Path.home() / ".git-claude-chat" / "last_repo.txt"
+        if config_file.exists():
+            with open(config_file, "r") as f:
+                target_repo_id = f.read().strip()
         
+    if not target_repo_id:
+        console.print("[red]No repository specified. Use the 'fetch' command first or specify a repository with --repo-id, or --owner and --repo")
+        sys.exit(1)
+        
+    # Initialize the MongoDB handler
+    mongodb = MongoDBHandler()
+    
+    # Get repository info
+    repo_info = mongodb.get_repository_info(target_repo_id)
+    if not repo_info:
+        console.print(f"[red]Repository with ID {target_repo_id} not found in the database")
+        sys.exit(1)
+        
+    # Confirm deletion
+    if not force:
+        confirm = typer.confirm(f"Are you sure you want to delete repository {repo_info['full_name']}?")
+        if not confirm:
+            console.print("[yellow]Deletion cancelled")
+            return
+            
+    try:
+        # Delete the repository
+        success = mongodb.delete_repository(target_repo_id)
+        
+        if success:
+            console.print(f"[green]Repository {repo_info['full_name']} deleted successfully")
+            
+            # If we deleted the global repo, update it
+            if REPO_ID == target_repo_id:
+                REPO_ID = None
+                
+                # Also clear the config file if it exists
+                config_file = Path.home() / ".git-claude-chat" / "last_repo.txt"
+                if config_file.exists():
+                    config_file.unlink()
+        else:
+            console.print("[red]Failed to delete repository")
+            sys.exit(1)
+            
     except Exception as e:
         console.print(f"[red]Error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
     app()
-@app.command("clear")
-def clear_repository(
-    repo_path: Optional[str] = typer.Option(
-        None, "--repo", "-r", help="Path to the Git repository"
-    ),
-    delete_files: bool = typer.Option(
-        False, "--delete", "-d", help="Whether to delete the repository files from disk"
-    ),
-):
-    """
-    Clear a cloned repository from memory and optionally delete the files from disk.
-    """
-    global REPO_PATH
-    
-    # Determine the repository path
-    if repo_path:
-        target_repo_path = repo_path
-    elif REPO_PATH:
-        target_repo_path = REPO_PATH
-    else:
-        # Try to load from config
-        config_file = Path.home() / ".git-claude-chat" / "last_repo.txt"
-        if config_file.exists():
-            with open(config_file, "r") as f:
-                target_repo_path = f.read().strip()
-        else:
-            console.print("[red]No repository specified. Use the 'clone' command first or specify a path with --repo")
-            sys.exit(1)
-    
-    # Initialize the Git handler
-    git_handler = GitHandler(local_path=target_repo_path)
-    
-    try:
-        # Clear the repository
-        success = git_handler.clear_repository(delete_files=delete_files)
-        
-        if success:
-            # If we cleared the global repo, update it
-            if REPO_PATH == target_repo_path:
-                REPO_PATH = None
-                
-                # Also clear the config file if it exists
-                config_file = Path.home() / ".git-claude-chat" / "last_repo.txt"
-                if config_file.exists():
-                    config_file.unlink()
-                    
-            console.print("[green]Repository has been cleared successfully")
-        else:
-            console.print("[red]Failed to clear repository")
-            sys.exit(1)
-            
-    except Exception as e:
-        console.print(f"[red]Error: {e}")
-        sys.exit(1)
